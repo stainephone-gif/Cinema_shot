@@ -158,6 +158,55 @@ def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+# OpenCV на Windows не открывает файлы по путям с кириллицей, поэтому чтение и
+# запись картинок/моделей идут через Python, а OpenCV получает только байты.
+
+
+def read_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def imread_u(path: str) -> np.ndarray | None:
+    data = np.fromfile(path, dtype=np.uint8)
+    return cv2.imdecode(data, cv2.IMREAD_COLOR) if data.size else None
+
+
+def imwrite_u(path: str, img: np.ndarray, quality: int = 92) -> bool:
+    ok, buf = cv2.imencode(os.path.splitext(path)[1] or ".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if ok:
+        buf.tofile(path)
+    return bool(ok)
+
+
+def open_video(path: str) -> tuple[cv2.VideoCapture, str]:
+    """Открыть видео; если OpenCV не справляется с путём (кириллица на Windows) —
+    скопировать файл во временную папку с латинским именем и открыть копию."""
+    cap = cv2.VideoCapture(path)
+    if cap.isOpened():
+        return cap, path
+    cap.release()
+    import shutil
+    import tempfile
+
+    tmp_dir = tempfile.gettempdir()
+    if not tmp_dir.isascii() and os.name == "nt":
+        for candidate in (r"C:\Temp", r"C:\Windows\Temp"):
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                tmp_dir = candidate
+                break
+            except OSError:
+                continue
+    tmp = os.path.join(tmp_dir, "cinema_shot_input" + os.path.splitext(path)[1].lower())
+    log(f"  OpenCV не открыл видео по этому пути, копирую во временный файл {tmp}")
+    shutil.copyfile(path, tmp)
+    cap = cv2.VideoCapture(tmp)
+    if not cap.isOpened():
+        raise SystemExit(f"Не удалось открыть видео: {path}")
+    return cap, tmp
+
+
 # ---------------------------------------------------------------------------
 # Детекторы
 # ---------------------------------------------------------------------------
@@ -195,7 +244,7 @@ class PersonDetector:
     STRIDES = (8, 16, 32)
 
     def __init__(self, model_path: str, conf: float = 0.4, nms: float = 0.5):
-        self.net = cv2.dnn.readNet(model_path)
+        self.net = cv2.dnn.readNetFromONNX(np.frombuffer(read_bytes(model_path), np.uint8))
         self.conf, self.nms = conf, nms
         grids, strides = [], []
         for st in self.STRIDES:
@@ -240,7 +289,8 @@ class Detectors:
     ):
         if not hasattr(cv2, "FaceDetectorYN"):
             raise RuntimeError("Нужен OpenCV >= 4.5.4 с cv2.FaceDetectorYN (pip install -U opencv-python)")
-        self.face = cv2.FaceDetectorYN.create(find_model(FACE_MODEL, face_model), "", (320, 320), score_thr, 0.3, 5000)
+        model_bytes = read_bytes(find_model(FACE_MODEL, face_model))
+        self.face = cv2.FaceDetectorYN.create("onnx", model_bytes, b"", (320, 320), score_thr, 0.3, 5000)
         self.input_size: tuple[int, int] | None = None
         self.persons: PersonDetector | None = None
         if use_persons:
@@ -324,10 +374,8 @@ def analyze(
     hero_min_height: float,
     hero_rel_area: float,
     likely_cut: float = 0.2,
-) -> tuple[list[FrameInfo], float, tuple[int, int]]:
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise SystemExit(f"Не удалось открыть видео: {path}")
+) -> tuple[list[FrameInfo], float, tuple[int, int], str]:
+    cap, opened_path = open_video(path)
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -373,7 +421,7 @@ def analyze(
             log(f"  анализ: {idx}/{total} кадров ({100 * idx // total}%)")
     cap.release()
     log(f"  анализ завершён: {idx} кадров, {fps:.2f} к/с, {width}x{height}")
-    return infos, fps, (width, height)
+    return infos, fps, (width, height), opened_path
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +567,7 @@ def build_keyframes(
 
 def save_frames(path: str, keyframes: list[Keyframe], out_dir: str, quality: int) -> None:
     wanted = {k.index: k for k in keyframes}
-    cap = cv2.VideoCapture(path)
+    cap, _ = open_video(path)
     idx = 0
     saved = 0
     while wanted:
@@ -531,7 +579,10 @@ def save_frames(path: str, keyframes: list[Keyframe], out_dir: str, quality: int
             k.filename = (
                 f"{saved + 1:04d}_shot{k.shot:02d}_{format_timecode(k.time_sec, '-')}_{k.reason}.jpg"
             )
-            cv2.imwrite(os.path.join(out_dir, k.filename), frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            if not imwrite_u(os.path.join(out_dir, k.filename), frame, quality):
+                log(f"  предупреждение: не удалось записать {k.filename}")
+                k.filename = ""
+                continue
             saved += 1
         idx += 1
     cap.release()
@@ -560,7 +611,7 @@ def contact_sheet(keyframes: list[Keyframe], out_dir: str, cols: int = 4, thumb_
         return None
     thumbs = []
     for k in frames:
-        img = cv2.imread(os.path.join(out_dir, k.filename))
+        img = imread_u(os.path.join(out_dir, k.filename))
         if img is None:
             continue
         scale = thumb_w / img.shape[1]
@@ -586,7 +637,7 @@ def contact_sheet(keyframes: list[Keyframe], out_dir: str, cols: int = 4, thumb_
         rows.append(np.hstack(row))
     sheet = np.vstack(rows)
     out = os.path.join(out_dir, "contact_sheet.jpg")
-    cv2.imwrite(out, sheet, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    imwrite_u(out, sheet, 90)
     return out
 
 
@@ -639,7 +690,9 @@ def main(argv: Iterable[str] | None = None) -> int:
         person_model=args.person_model,
         score_thr=args.face_score,
     )
-    infos, fps, size = analyze(video, detectors, max(1, args.detect_every), args.hero_min_height, args.hero_rel_area)
+    infos, fps, size, opened_path = analyze(
+        video, detectors, max(1, args.detect_every), args.hero_min_height, args.hero_rel_area
+    )
     if not infos:
         log("В видео нет кадров.")
         return 1
@@ -650,7 +703,12 @@ def main(argv: Iterable[str] | None = None) -> int:
     log(f"  планов: {len(cuts) + 1}, ключевых кадров: {len(keyframes)}")
 
     log(f"3/3 Сохранение кадров в {out_dir}…")
-    save_frames(video, keyframes, out_dir, args.quality)
+    save_frames(opened_path, keyframes, out_dir, args.quality)
+    if opened_path != video:
+        try:
+            os.remove(opened_path)
+        except OSError:
+            pass
     write_manifest(keyframes, out_dir, video, fps, size)
     if args.contact_sheet:
         sheet = contact_sheet(keyframes, out_dir)
