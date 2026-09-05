@@ -1,3 +1,5 @@
 __pycache__/
 *.pyc
 *_storyboard/
+# Крупная модель YOLOX (~35 МБ) скачивается автоматически при первом запуске
+models/object_detection_yolox_2022nov.onnx

@@ -8,7 +8,8 @@ cinema_shot — раскадровка видео по ключевым кадр
   * склейка (монтажный стык) — сохраняется последний кадр до склейки и первый после;
   * смена крупности внутри плана (деталь / крупный / средний / общий) — по размеру
     лица в кадре;
-  * изменение количества героев в кадре — по числу найденных лиц (и, опционально, фигур).
+  * изменение количества героев в кадре — по числу крупных фигур (YOLOX) или лиц;
+    мелкие фигуры на фоне считаются массовкой и в «героев» не входят.
 
 Дополнительно сохраняются первый и последний кадры видео, а по желанию — кадр
 раз в N секунд внутри длинных статичных планов.
@@ -17,12 +18,14 @@ cinema_shot — раскадровка видео по ключевым кадр
 и, по желанию, contact_sheet.jpg — общая «простыня» из миниатюр.
 
 Зависимости: opencv-python (или opencv-python-headless) >= 4.5.4, numpy.
-Модель лиц: models/face_detection_yunet_2023mar.onnx (скачивается автоматически, если нет).
+Модели (папка models/, скачиваются автоматически, если их нет):
+    face_detection_yunet_2023mar.onnx   — лица (YuNet, ~230 КБ)
+    object_detection_yolox_2022nov.onnx — люди (YOLOX-S, ~35 МБ)
 
 Пример:
     python cinema_shot.py clip.mp4
     python cinema_shot.py clip.mp4 -o storyboard --contact-sheet
-    python cinema_shot.py clip.mp4 --cut-threshold 0.25 --stable 8 --bodies
+    python cinema_shot.py clip.mp4 --cut-threshold 0.25 --stable 8 --no-persons
 """
 
 from __future__ import annotations
@@ -59,7 +62,7 @@ SHOT_SIZE_BY_FACE = [
     (0.12, "MS", "средний"),
     (0.00, "WS", "общий"),
 ]
-NO_FACE_SIZE = ("NF", "без лиц")
+NO_FACE_SIZE = ("NF", "без героев")
 
 REASON_RU = {
     "start": "начало видео",
@@ -83,14 +86,15 @@ class FrameInfo:
 
     index: int
     cut_score: float
-    faces: int
-    bodies: int
-    face_ratio: float  # высота самого большого лица / высота кадра
-    body_ratio: float  # высота самой большой фигуры / высота кадра
+    faces: int          # найдено лиц
+    heroes: int         # «герои» — крупные фигуры (или лица, если детектор людей выключен)
+    people_total: int   # все люди в кадре, включая массовку
+    face_ratio: float   # высота самого большого лица / высота кадра
+    body_ratio: float   # высота самой большой фигуры-героя / высота кадра
 
     @property
     def people(self) -> int:
-        return max(self.faces, self.bodies)
+        return self.heroes
 
     @property
     def size_code(self) -> str:
@@ -106,6 +110,7 @@ class Keyframe:
     reason: str
     reason_ru: str
     people: int
+    people_total: int
     size_code: str
     size_ru: str
     filename: str = ""
@@ -117,15 +122,20 @@ class Keyframe:
 
 
 def classify_size(face_ratio: float, body_ratio: float) -> str:
-    """Определить крупность по размеру лица; если лиц нет — по размеру фигуры."""
-    if face_ratio > 0:
+    """Определить крупность.
+
+    Если лицо достаточно крупное (средний план и ближе) — по лицу. Иначе — по
+    высоте самой большой фигуры-героя: фигура во весь кадр — средний план,
+    меньше — общий. Мелкое лицо без фигуры — общий; ничего нет — «без героев».
+    """
+    if face_ratio > SHOT_SIZE_BY_FACE[-2][0]:
         for threshold, code, _ in SHOT_SIZE_BY_FACE:
             if face_ratio > threshold:
                 return code
-        return "WS"
     if body_ratio > 0:
-        # Фигура почти во весь кадр — средний план, иначе общий.
-        return "MS" if body_ratio > 0.8 else "WS"
+        return "MS" if body_ratio > 0.85 else "WS"
+    if face_ratio > 0:
+        return "WS"
     return NO_FACE_SIZE[0]
 
 
@@ -153,48 +163,91 @@ def log(msg: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-MODEL_NAME = "face_detection_yunet_2023mar.onnx"
-MODEL_URL = (
-    "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/"
-    "models/face_detection_yunet/" + MODEL_NAME
-)
+FACE_MODEL = "face_detection_yunet_2023mar.onnx"
+PERSON_MODEL = "object_detection_yolox_2022nov.onnx"
+ZOO = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
+MODEL_URLS = {
+    FACE_MODEL: ZOO + "face_detection_yunet/" + FACE_MODEL,
+    PERSON_MODEL: ZOO + "object_detection_yolox/" + PERSON_MODEL,
+}
 
 
-def find_model(explicit: str | None) -> str:
-    """Найти ONNX-модель YuNet: аргумент --model, папка models/ рядом со скриптом, иначе скачать."""
-    candidates = []
-    if explicit:
-        candidates.append(explicit)
+def find_model(name: str, explicit: str | None) -> str:
+    """Найти модель: явный путь, папка models/ рядом со скриптом, иначе скачать из opencv_zoo."""
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates += [os.path.join(here, "models", MODEL_NAME), os.path.join(here, MODEL_NAME)]
+    candidates = [c for c in (explicit, os.path.join(here, "models", name), os.path.join(here, name)) if c]
     for c in candidates:
         if os.path.isfile(c) and os.path.getsize(c) > 10_000:
             return c
-    target = candidates[-2]
+    target = os.path.join(here, "models", name)
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    log(f"  модель лиц не найдена, скачиваю {MODEL_URL} → {target}")
+    log(f"  модель {name} не найдена, скачиваю {MODEL_URLS[name]}")
     import urllib.request
 
-    urllib.request.urlretrieve(MODEL_URL, target)
+    urllib.request.urlretrieve(MODEL_URLS[name], target)
     return target
 
 
-class Detectors:
-    """Детектор лиц YuNet (cv2.FaceDetectorYN) и, если доступен, HOG-детектор фигур."""
+class PersonDetector:
+    """YOLOX-S (COCO) через cv2.dnn — считает людей в кадре, в том числе спиной к камере."""
 
-    def __init__(self, use_bodies: bool, model_path: str | None = None, score_thr: float = 0.7):
+    INPUT = 640
+    STRIDES = (8, 16, 32)
+
+    def __init__(self, model_path: str, conf: float = 0.4, nms: float = 0.5):
+        self.net = cv2.dnn.readNet(model_path)
+        self.conf, self.nms = conf, nms
+        grids, strides = [], []
+        for st in self.STRIDES:
+            n = self.INPUT // st
+            xv, yv = np.meshgrid(np.arange(n), np.arange(n))
+            grids.append(np.stack((xv, yv), 2).reshape(-1, 2))
+            strides.append(np.full((n * n, 1), st))
+        self.grids = np.concatenate(grids).astype(np.float32)
+        self.strides = np.concatenate(strides).astype(np.float32)
+
+    def detect(self, bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+        h, w = bgr.shape[:2]
+        r = min(self.INPUT / h, self.INPUT / w)
+        resized = cv2.resize(bgr, (int(w * r), int(h * r)))
+        canvas = np.full((self.INPUT, self.INPUT, 3), 114, np.uint8)
+        canvas[: resized.shape[0], : resized.shape[1]] = resized
+        blob = canvas.astype(np.float32).transpose(2, 0, 1)[None]
+        self.net.setInput(blob)
+        out = self.net.forward(self.net.getUnconnectedOutLayersNames())[0][0]
+        xy = (out[:, :2] + self.grids) * self.strides
+        wh = np.exp(out[:, 2:4]) * self.strides
+        scores = out[:, 4] * out[:, 5]  # objectness * класс 0 (person)
+        keep = scores >= self.conf
+        if not keep.any():
+            return []
+        boxes = np.concatenate([xy[keep] - wh[keep] / 2, wh[keep]], axis=1) / r
+        idx = cv2.dnn.NMSBoxes(boxes.tolist(), scores[keep].tolist(), self.conf, self.nms)
+        if len(idx) == 0:
+            return []
+        return [tuple(int(v) for v in boxes[int(i)]) for i in np.asarray(idx).flatten()]
+
+
+class Detectors:
+    """Детектор лиц YuNet (cv2.FaceDetectorYN) и детектор людей YOLOX (cv2.dnn)."""
+
+    def __init__(
+        self,
+        use_persons: bool,
+        face_model: str | None = None,
+        person_model: str | None = None,
+        score_thr: float = 0.7,
+    ):
         if not hasattr(cv2, "FaceDetectorYN"):
             raise RuntimeError("Нужен OpenCV >= 4.5.4 с cv2.FaceDetectorYN (pip install -U opencv-python)")
-        self.model_path = find_model(model_path)
-        self.face = cv2.FaceDetectorYN.create(self.model_path, "", (320, 320), score_thr, 0.3, 5000)
+        self.face = cv2.FaceDetectorYN.create(find_model(FACE_MODEL, face_model), "", (320, 320), score_thr, 0.3, 5000)
         self.input_size: tuple[int, int] | None = None
-        self.hog = None
-        if use_bodies:
-            if hasattr(cv2, "HOGDescriptor"):
-                self.hog = cv2.HOGDescriptor()
-                self.hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
-            else:
-                log("  предупреждение: в этой сборке OpenCV нет HOG-детектора, --bodies игнорируется")
+        self.persons: PersonDetector | None = None
+        if use_persons:
+            try:
+                self.persons = PersonDetector(find_model(PERSON_MODEL, person_model))
+            except Exception as exc:  # noqa: BLE001 — нет сети/модели: работаем только по лицам
+                log(f"  предупреждение: детектор людей недоступен ({exc}), считаю героев по лицам")
 
     def faces(self, bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
         h, w = bgr.shape[:2]
@@ -207,16 +260,17 @@ class Detectors:
         return [tuple(int(v) for v in row[:4]) for row in found]
 
     def bodies(self, bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
-        if self.hog is None:
-            return []
-        rects, weights = self.hog.detectMultiScale(
-            bgr, winStride=(8, 8), padding=(8, 8), scale=1.05
-        )
-        out = []
-        for r, w in zip(rects, weights):
-            if float(w) >= 0.5:
-                out.append(tuple(int(v) for v in r))
-        return merge_rects(out)
+        return self.persons.detect(bgr) if self.persons else []
+
+
+def split_heroes(
+    bodies: list[tuple[int, int, int, int]], frame_h: int, min_height: float, rel_area: float
+) -> list[tuple[int, int, int, int]]:
+    """Отделить героев от массовки: фигура достаточно высокая и по площади сопоставима с самой крупной."""
+    if not bodies:
+        return []
+    largest = max(b[2] * b[3] for b in bodies)
+    return [b for b in bodies if b[3] >= min_height * frame_h and b[2] * b[3] >= rel_area * largest]
 
 
 def merge_rects(rects: list[tuple[int, int, int, int]], iou_thr: float = 0.3):
@@ -263,7 +317,14 @@ def cut_score(prev_sig, cur_sig) -> float:
     return 0.5 * float(hist_d) + 0.5 * min(1.0, pix_d * 4.0)
 
 
-def analyze(path: str, detectors: Detectors, detect_every: int) -> tuple[list[FrameInfo], float, tuple[int, int]]:
+def analyze(
+    path: str,
+    detectors: Detectors,
+    detect_every: int,
+    hero_min_height: float,
+    hero_rel_area: float,
+    likely_cut: float = 0.2,
+) -> tuple[list[FrameInfo], float, tuple[int, int]]:
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
         raise SystemExit(f"Не удалось открыть видео: {path}")
@@ -274,7 +335,7 @@ def analyze(path: str, detectors: Detectors, detect_every: int) -> tuple[list[Fr
 
     infos: list[FrameInfo] = []
     prev_sig = None
-    last_det = (0, 0, 0.0, 0.0)
+    last_det = (0, 0, 0, 0.0, 0.0)
     idx = 0
     while True:
         ok, frame = cap.read()
@@ -289,12 +350,22 @@ def analyze(path: str, detectors: Detectors, detect_every: int) -> tuple[list[Fr
         score = cut_score(prev_sig, sig) if prev_sig is not None else 0.0
         prev_sig = sig
 
-        if idx % detect_every == 0:
+        # Детекция в каждом N-м кадре, а также сразу после вероятной склейки,
+        # чтобы кадр «после склейки» не унаследовал результаты предыдущего плана.
+        if idx % detect_every == 0 or score >= likely_cut:
             faces = detectors.faces(frame)
-            bodies = detectors.bodies(frame)
             face_ratio = max((r[3] / fh for r in faces), default=0.0)
-            body_ratio = max((r[3] / fh for r in bodies), default=0.0)
-            last_det = (len(faces), len(bodies), face_ratio, body_ratio)
+            if detectors.persons:
+                bodies = detectors.bodies(frame)
+                heroes = split_heroes(bodies, fh, hero_min_height, hero_rel_area)
+                body_ratio = max((min(1.0, r[3] / fh) for r in heroes), default=0.0)
+                n_heroes, n_total = len(heroes), len(bodies)
+            else:
+                # Без детектора людей: герой — лицо, сопоставимое по размеру с самым крупным.
+                hero_faces = [r for r in faces if r[3] >= 0.35 * face_ratio * fh]
+                n_heroes, n_total, body_ratio = len(hero_faces), len(faces), 0.0
+                face_ratio = max((r[3] / fh for r in hero_faces), default=0.0)
+            last_det = (len(faces), n_heroes, n_total, face_ratio, body_ratio)
 
         infos.append(FrameInfo(idx, score, *last_det))
         idx += 1
@@ -433,6 +504,7 @@ def build_keyframes(
                 reason=reason,
                 reason_ru=reason_ru,
                 people=f.people,
+                people_total=f.people_total,
                 size_code=f.size_code,
                 size_ru=size_code_to_ru(f.size_code),
             )
@@ -497,7 +569,7 @@ def contact_sheet(keyframes: list[Keyframe], out_dir: str, cols: int = 4, thumb_
         canvas = np.full((img.shape[0] + label_h, thumb_w, 3), 24, dtype=np.uint8)
         canvas[:img.shape[0]] = img
         # cv2.putText не умеет кириллицу — подписи латиницей.
-        line1 = f"#{k.shot} {k.timecode} {k.size_code} x{k.people}"
+        line1 = f"#{k.shot} {k.timecode} {k.size_code} heroes:{k.people} all:{k.people_total}"
         line2 = k.reason
         cv2.putText(canvas, line1, (4, img.shape[0] + 13), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
         cv2.putText(canvas, line2, (4, img.shape[0] + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 220, 255), 1, cv2.LINE_AA)
@@ -534,10 +606,13 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     p.add_argument("--cut-ratio", type=float, default=3.0, help="во сколько раз различие должно превышать соседние кадры")
     p.add_argument("--min-shot", type=int, default=6, help="минимальная длина плана в кадрах")
     p.add_argument("--stable", type=int, default=12, help="сколько кадров подряд состояние должно держаться, чтобы считаться сменой")
-    p.add_argument("--detect-every", type=int, default=1, help="искать лица не в каждом кадре, а в каждом N-м (ускорение)")
-    p.add_argument("--model", help="путь к ONNX-модели YuNet (по умолчанию models/ рядом со скриптом; при отсутствии скачивается)")
+    p.add_argument("--detect-every", type=int, default=2, help="искать людей и лица не в каждом кадре, а в каждом N-м (ускорение)")
+    p.add_argument("--no-persons", action="store_true", help="не использовать детектор людей YOLOX, считать героев только по лицам (быстрее)")
+    p.add_argument("--hero-min-height", type=float, default=0.2, help="фигура ниже этой доли высоты кадра — массовка")
+    p.add_argument("--hero-rel-area", type=float, default=0.3, help="фигура с площадью меньше этой доли от самой крупной — массовка")
+    p.add_argument("--face-model", help="путь к ONNX-модели YuNet (по умолчанию models/ рядом со скриптом; при отсутствии скачивается)")
+    p.add_argument("--person-model", help="путь к ONNX-модели YOLOX (по умолчанию models/ рядом со скриптом; при отсутствии скачивается, ~35 МБ)")
     p.add_argument("--face-score", type=float, default=0.7, help="порог уверенности детектора лиц (0..1)")
-    p.add_argument("--bodies", action="store_true", help="дополнительно считать фигуры людей (HOG), медленнее")
     p.add_argument("--interval", type=float, default=0.0, help="дополнительно сохранять кадр каждые N секунд внутри плана (0 — выкл.)")
     p.add_argument("--quality", type=int, default=92, help="качество JPG (1..100)")
     p.add_argument("--contact-sheet", action="store_true", help="собрать общую картинку-простыню из миниатюр")
@@ -558,8 +633,13 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     log(f"Видео: {video}")
     log("1/3 Анализ кадров…")
-    detectors = Detectors(use_bodies=args.bodies, model_path=args.model, score_thr=args.face_score)
-    infos, fps, size = analyze(video, detectors, max(1, args.detect_every))
+    detectors = Detectors(
+        use_persons=not args.no_persons,
+        face_model=args.face_model,
+        person_model=args.person_model,
+        score_thr=args.face_score,
+    )
+    infos, fps, size = analyze(video, detectors, max(1, args.detect_every), args.hero_min_height, args.hero_rel_area)
     if not infos:
         log("В видео нет кадров.")
         return 1
@@ -577,10 +657,10 @@ def main(argv: Iterable[str] | None = None) -> int:
         if sheet:
             log(f"  простыня: {sheet}")
 
-    print(f"{'кадр':>6}  {'время':>12}  {'план':>4}  {'люди':>4}  {'крупность':<9}  причина")
+    print(f"{'кадр':>6}  {'время':>12}  {'план':>4}  {'герои':>5}  {'всего':>5}  {'крупность':<11}  причина")
     for k in keyframes:
         if k.filename:
-            print(f"{k.index:>6}  {k.timecode:>12}  {k.shot:>4}  {k.people:>4}  {k.size_ru:<9}  {k.reason_ru}")
+            print(f"{k.index:>6}  {k.timecode:>12}  {k.shot:>4}  {k.people:>5}  {k.people_total:>5}  {k.size_ru:<11}  {k.reason_ru}")
     print(f"\nСохранено {sum(1 for k in keyframes if k.filename)} кадров в {out_dir}")
     return 0
 
