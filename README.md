@@ -18,8 +18,12 @@
 ## Установка
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
+
+На Windows команда `pip` сама по себе часто не находится (не добавлена в PATH), поэтому
+вызывайте её через `python -m pip`. Если и это даёт «No module named pip», один раз
+выполните `python -m ensurepip --upgrade`.
 
 Нужен Python 3.9+ и OpenCV не ниже 4.5.4 (проверено на 5.0). ffmpeg не требуется.
 
@@ -33,6 +37,7 @@ pip install -r requirements.txt
 
 ```bash
 python cinema_shot.py clip.mp4
+python cinema_shot.py "D:\Видео\clip.mp4" --contact-sheet     # Windows: путь с пробелами и кириллицей — в кавычках
 ```
 
 Кадры появятся в папке `clip_storyboard` рядом с видео. Имена файлов:
