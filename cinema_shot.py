@@ -8,7 +8,7 @@ cinema_shot — раскадровка видео по ключевым кадр
   * склейка (монтажный стык) — сохраняется последний кадр до склейки и первый после;
   * смена крупности внутри плана (деталь / крупный / средний / общий) — по размеру
     лица в кадре;
-  * изменение количества героев в кадре — по числу крупных фигур (YOLOX) или лиц;
+  * изменение состава героев в кадре — люди и животные, найденные YOLOX (или лица);
     мелкие фигуры на фоне считаются массовкой и в «героев» не входят.
 
 Дополнительно сохраняются первый и последний кадры видео, а по желанию — кадр
@@ -64,13 +64,19 @@ SHOT_SIZE_BY_FACE = [
 ]
 NO_FACE_SIZE = ("NF", "без героев")
 
+# Классы COCO, которые считаем «героями»: люди и животные.
+HERO_CLASSES = {
+    0: "человек", 14: "птица", 15: "кошка", 16: "собака", 17: "лошадь", 18: "овца",
+    19: "корова", 20: "слон", 21: "медведь", 22: "зебра", 23: "жираф",
+}
+
 REASON_RU = {
     "start": "начало видео",
     "end": "конец видео",
     "cut_before": "до склейки",
     "cut_after": "после склейки",
     "size_change": "смена крупности",
-    "count_change": "изменение числа героев",
+    "count_change": "изменение состава героев",
     "interval": "кадр по интервалу",
 }
 
@@ -91,6 +97,8 @@ class FrameInfo:
     people_total: int   # все люди в кадре, включая массовку
     face_ratio: float   # высота самого большого лица / высота кадра
     body_ratio: float   # высота самой большой фигуры-героя / высота кадра
+    body_full: bool     # фигура-герой видна целиком (не обрезана нижним краем кадра)
+    composition: str    # кто в кадре, например «1 человек, 1 собака»
 
     @property
     def people(self) -> int:
@@ -98,7 +106,7 @@ class FrameInfo:
 
     @property
     def size_code(self) -> str:
-        return classify_size(self.face_ratio, self.body_ratio)
+        return classify_size(self.face_ratio, self.body_ratio, self.body_full)
 
 
 @dataclass
@@ -111,6 +119,7 @@ class Keyframe:
     reason_ru: str
     people: int
     people_total: int
+    composition: str
     size_code: str
     size_ru: str
     filename: str = ""
@@ -121,19 +130,20 @@ class Keyframe:
 # ---------------------------------------------------------------------------
 
 
-def classify_size(face_ratio: float, body_ratio: float) -> str:
+def classify_size(face_ratio: float, body_ratio: float, body_full: bool = False) -> str:
     """Определить крупность.
 
     Если лицо достаточно крупное (средний план и ближе) — по лицу. Иначе — по
-    высоте самой большой фигуры-героя: фигура во весь кадр — средний план,
-    меньше — общий. Мелкое лицо без фигуры — общий; ничего нет — «без героев».
+    фигуре-герою: фигура видна целиком — общий план; фигура обрезана кадром и
+    занимает почти всю высоту — средний. Мелкое лицо без фигуры — общий;
+    ничего нет — «без героев».
     """
     if face_ratio > SHOT_SIZE_BY_FACE[-2][0]:
         for threshold, code, _ in SHOT_SIZE_BY_FACE:
             if face_ratio > threshold:
                 return code
     if body_ratio > 0:
-        return "MS" if body_ratio > 0.85 else "WS"
+        return "MS" if body_ratio > 0.85 and not body_full else "WS"
     if face_ratio > 0:
         return "WS"
     return NO_FACE_SIZE[0]
@@ -238,7 +248,7 @@ def find_model(name: str, explicit: str | None) -> str:
 
 
 class PersonDetector:
-    """YOLOX-S (COCO) через cv2.dnn — считает людей в кадре, в том числе спиной к камере."""
+    """YOLOX-S (COCO) через cv2.dnn — находит людей (в том числе спиной к камере) и животных."""
 
     INPUT = 640
     STRIDES = (8, 16, 32)
@@ -255,7 +265,8 @@ class PersonDetector:
         self.grids = np.concatenate(grids).astype(np.float32)
         self.strides = np.concatenate(strides).astype(np.float32)
 
-    def detect(self, bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def detect(self, bgr: np.ndarray) -> list[tuple[int, int, int, int, int]]:
+        """Вернуть (x, y, w, h, класс COCO) для людей и животных из HERO_CLASSES."""
         h, w = bgr.shape[:2]
         r = min(self.INPUT / h, self.INPUT / w)
         resized = cv2.resize(bgr, (int(w * r), int(h * r)))
@@ -266,15 +277,19 @@ class PersonDetector:
         out = self.net.forward(self.net.getUnconnectedOutLayersNames())[0][0]
         xy = (out[:, :2] + self.grids) * self.strides
         wh = np.exp(out[:, 2:4]) * self.strides
-        scores = out[:, 4] * out[:, 5]  # objectness * класс 0 (person)
+        cls_ids = np.array(sorted(HERO_CLASSES), dtype=int)
+        cls_scores = out[:, 4:5] * out[:, 5 + cls_ids]  # objectness * вероятность класса
+        best = cls_scores.argmax(axis=1)
+        scores = cls_scores[np.arange(len(best)), best]
         keep = scores >= self.conf
         if not keep.any():
             return []
         boxes = np.concatenate([xy[keep] - wh[keep] / 2, wh[keep]], axis=1) / r
-        idx = cv2.dnn.NMSBoxes(boxes.tolist(), scores[keep].tolist(), self.conf, self.nms)
+        classes = cls_ids[best[keep]]
+        idx = cv2.dnn.NMSBoxesBatched(boxes.tolist(), scores[keep].tolist(), classes.tolist(), self.conf, self.nms)
         if len(idx) == 0:
             return []
-        return [tuple(int(v) for v in boxes[int(i)]) for i in np.asarray(idx).flatten()]
+        return [tuple(int(v) for v in boxes[int(i)]) + (int(classes[int(i)]),) for i in np.asarray(idx).flatten()]
 
 
 class Detectors:
@@ -309,18 +324,23 @@ class Detectors:
             return []
         return [tuple(int(v) for v in row[:4]) for row in found]
 
-    def bodies(self, bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
+    def bodies(self, bgr: np.ndarray) -> list[tuple[int, int, int, int, int]]:
         return self.persons.detect(bgr) if self.persons else []
 
 
-def split_heroes(
-    bodies: list[tuple[int, int, int, int]], frame_h: int, min_height: float, rel_area: float
-) -> list[tuple[int, int, int, int]]:
+def split_heroes(bodies: list, frame_h: int, min_height: float, rel_area: float) -> list:
     """Отделить героев от массовки: фигура достаточно высокая и по площади сопоставима с самой крупной."""
     if not bodies:
         return []
     largest = max(b[2] * b[3] for b in bodies)
     return [b for b in bodies if b[3] >= min_height * frame_h and b[2] * b[3] >= rel_area * largest]
+
+
+def describe(bodies: list) -> str:
+    """«1 человек, 1 собака» по списку фигур с классом COCO в последнем элементе."""
+    counts = Counter(HERO_CLASSES.get(b[-1], "человек") for b in bodies)
+    order = sorted(counts, key=lambda k: (k != "человек", k))
+    return ", ".join(f"{counts[k]} {k}" for k in order)
 
 
 def merge_rects(rects: list[tuple[int, int, int, int]], iou_thr: float = 0.3):
@@ -383,7 +403,7 @@ def analyze(
 
     infos: list[FrameInfo] = []
     prev_sig = None
-    last_det = (0, 0, 0, 0.0, 0.0)
+    last_det = (0, 0, 0, 0.0, 0.0, False, "")
     idx = 0
     while True:
         ok, frame = cap.read()
@@ -403,17 +423,22 @@ def analyze(
         if idx % detect_every == 0 or score >= likely_cut:
             faces = detectors.faces(frame)
             face_ratio = max((r[3] / fh for r in faces), default=0.0)
+            body_full = False
             if detectors.persons:
                 bodies = detectors.bodies(frame)
                 heroes = split_heroes(bodies, fh, hero_min_height, hero_rel_area)
                 body_ratio = max((min(1.0, r[3] / fh) for r in heroes), default=0.0)
-                n_heroes, n_total = len(heroes), len(bodies)
+                if heroes:
+                    largest = max(heroes, key=lambda r: r[3])
+                    body_full = largest[1] + largest[3] < fh * 0.97  # ноги не срезаны кадром
+                n_heroes, n_total, comp = len(heroes), len(bodies), describe(heroes)
             else:
                 # Без детектора людей: герой — лицо, сопоставимое по размеру с самым крупным.
                 hero_faces = [r for r in faces if r[3] >= 0.35 * face_ratio * fh]
                 n_heroes, n_total, body_ratio = len(hero_faces), len(faces), 0.0
                 face_ratio = max((r[3] / fh for r in hero_faces), default=0.0)
-            last_det = (len(faces), n_heroes, n_total, face_ratio, body_ratio)
+                comp = f"{n_heroes} человек" if n_heroes else ""
+            last_det = (len(faces), n_heroes, n_total, face_ratio, body_ratio, body_full, comp)
 
         infos.append(FrameInfo(idx, score, *last_det))
         idx += 1
@@ -460,7 +485,7 @@ def detect_state_changes(
 ) -> list[tuple[int, str]]:
     """Внутри каждого плана найти кадры, где устойчиво меняется крупность или число людей.
 
-    Состояние кадра = (число людей, код крупности). Новое состояние считается
+    Состояние кадра = (состав героев, код крупности). Новое состояние считается
     подтверждённым, когда оно преобладает (>= 70 %) в окне из `stable` кадров.
     Возвращает список (индекс кадра, причина).
     """
@@ -471,7 +496,7 @@ def detect_state_changes(
         confirmed: tuple[int, str] | None = None
         for i in range(start, end):
             f = infos[i]
-            window.append((i, (f.people, f.size_code)))
+            window.append((i, (f.composition, f.size_code)))
             if len(window) < min(stable, end - start):
                 continue
             mode, cnt = Counter(st for _, st in window).most_common(1)[0]
@@ -553,6 +578,7 @@ def build_keyframes(
                 reason_ru=reason_ru,
                 people=f.people,
                 people_total=f.people_total,
+                composition=f.composition,
                 size_code=f.size_code,
                 size_ru=size_code_to_ru(f.size_code),
             )
@@ -715,10 +741,13 @@ def main(argv: Iterable[str] | None = None) -> int:
         if sheet:
             log(f"  простыня: {sheet}")
 
-    print(f"{'кадр':>6}  {'время':>12}  {'план':>4}  {'герои':>5}  {'всего':>5}  {'крупность':<11}  причина")
+    print(f"{'кадр':>6}  {'время':>12}  {'план':>4}  {'всего':>5}  {'крупность':<11}  {'герои':<22}  причина")
     for k in keyframes:
         if k.filename:
-            print(f"{k.index:>6}  {k.timecode:>12}  {k.shot:>4}  {k.people:>5}  {k.people_total:>5}  {k.size_ru:<11}  {k.reason_ru}")
+            print(
+                f"{k.index:>6}  {k.timecode:>12}  {k.shot:>4}  {k.people_total:>5}  "
+                f"{k.size_ru:<11}  {k.composition or '—':<22}  {k.reason_ru}"
+            )
     print(f"\nСохранено {sum(1 for k in keyframes if k.filename)} кадров в {out_dir}")
     return 0
 
