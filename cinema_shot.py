@@ -25,6 +25,8 @@ cinema_shot — раскадровка видео по ключевым кадр
 Пример:
     python cinema_shot.py clip.mp4
     python cinema_shot.py clip.mp4 -o storyboard --contact-sheet
+    python cinema_shot.py D:\Видео            # все видео из папки, результаты рядом с каждым
+    python cinema_shot.py D:\Видео -o D:\Раскадровки --contact-sheet
     python cinema_shot.py clip.mp4 --cut-threshold 0.25 --stable 8 --no-persons
 """
 
@@ -213,6 +215,11 @@ def open_video(path: str) -> tuple[cv2.VideoCapture, str]:
     shutil.copyfile(path, tmp)
     cap = cv2.VideoCapture(tmp)
     if not cap.isOpened():
+        cap.release()
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
         raise SystemExit(f"Не удалось открыть видео: {path}")
     return cap, tmp
 
@@ -677,8 +684,10 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         description="Раскадровка видео: сохраняет ключевые кадры (склейки, смена крупности, число героев) в JPG.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("video", help="путь к видеофайлу")
-    p.add_argument("-o", "--out", help="папка для кадров (по умолчанию <имя видео>_storyboard рядом с видео)")
+    p.add_argument("inputs", nargs="+", metavar="video", help="видеофайлы и/или папки с видео (папка обрабатывается целиком)")
+    p.add_argument("-o", "--out", help="папка для результатов; для одного файла — сама папка кадров, "
+                                       "для нескольких — родительская, внутри создаются <имя видео>_storyboard")
+    p.add_argument("-r", "--recursive", action="store_true", help="искать видео и во вложенных папках")
     p.add_argument("--cut-threshold", type=float, default=0.30, help="порог различия кадров для склейки (0..1)")
     p.add_argument("--cut-ratio", type=float, default=3.0, help="во сколько раз различие должно превышать соседние кадры")
     p.add_argument("--min-shot", type=int, default=6, help="минимальная длина плана в кадрах")
@@ -696,32 +705,42 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Iterable[str] | None = None) -> int:
-    args = parse_args(argv)
-    video = args.video
-    if not os.path.isfile(video):
-        log(f"Файл не найден: {video}")
-        return 1
-    out_dir = args.out or os.path.join(
-        os.path.dirname(os.path.abspath(video)),
-        os.path.splitext(os.path.basename(video))[0] + "_storyboard",
-    )
-    os.makedirs(out_dir, exist_ok=True)
+VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".mpg", ".mpeg", ".mts", ".m2ts", ".wmv", ".flv", ".3gp"}
 
+
+def collect_videos(inputs: list[str], recursive: bool) -> list[str]:
+    """Развернуть список путей: файлы берутся как есть, папки — все видео внутри (по алфавиту)."""
+    videos: list[str] = []
+    for item in inputs:
+        if os.path.isdir(item):
+            found = []
+            if recursive:
+                for root, _dirs, files in os.walk(item):
+                    found += [os.path.join(root, f) for f in files]
+            else:
+                found = [os.path.join(item, f) for f in os.listdir(item)]
+            found = [f for f in found if os.path.isfile(f) and os.path.splitext(f)[1].lower() in VIDEO_EXT]
+            if not found:
+                log(f"В папке нет видео: {item}")
+            videos += sorted(found, key=lambda f: f.lower())
+        elif os.path.isfile(item):
+            videos.append(item)
+        else:
+            log(f"Файл не найден: {item}")
+    seen: set[str] = set()
+    return [v for v in videos if not (os.path.abspath(v) in seen or seen.add(os.path.abspath(v)))]
+
+
+def process_video(video: str, out_dir: str, detectors: Detectors, args: argparse.Namespace) -> int:
+    """Обработать одно видео, вернуть число сохранённых кадров."""
     log(f"Видео: {video}")
     log("1/3 Анализ кадров…")
-    detectors = Detectors(
-        use_persons=not args.no_persons,
-        face_model=args.face_model,
-        person_model=args.person_model,
-        score_thr=args.face_score,
-    )
     infos, fps, size, opened_path = analyze(
         video, detectors, max(1, args.detect_every), args.hero_min_height, args.hero_rel_area
     )
     if not infos:
-        log("В видео нет кадров.")
-        return 1
+        log("  в видео нет кадров, пропускаю")
+        return 0
 
     log("2/3 Поиск склеек и изменений…")
     cuts = detect_cuts(infos, args.cut_threshold, args.cut_ratio, args.min_shot)
@@ -729,6 +748,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     log(f"  планов: {len(cuts) + 1}, ключевых кадров: {len(keyframes)}")
 
     log(f"3/3 Сохранение кадров в {out_dir}…")
+    os.makedirs(out_dir, exist_ok=True)
     save_frames(opened_path, keyframes, out_dir, args.quality)
     if opened_path != video:
         try:
@@ -741,15 +761,58 @@ def main(argv: Iterable[str] | None = None) -> int:
         if sheet:
             log(f"  простыня: {sheet}")
 
+    print(f"\n=== {video}")
     print(f"{'кадр':>6}  {'время':>12}  {'план':>4}  {'всего':>5}  {'крупность':<11}  {'герои':<22}  причина")
+    saved = 0
     for k in keyframes:
         if k.filename:
+            saved += 1
             print(
                 f"{k.index:>6}  {k.timecode:>12}  {k.shot:>4}  {k.people_total:>5}  "
                 f"{k.size_ru:<11}  {k.composition or '—':<22}  {k.reason_ru}"
             )
-    print(f"\nСохранено {sum(1 for k in keyframes if k.filename)} кадров в {out_dir}")
-    return 0
+    print(f"Сохранено {saved} кадров в {out_dir}")
+    return saved
+
+
+def main(argv: Iterable[str] | None = None) -> int:
+    args = parse_args(argv)
+    videos = collect_videos(args.inputs, args.recursive)
+    if not videos:
+        log("Нечего обрабатывать.")
+        return 1
+
+    detectors = Detectors(
+        use_persons=not args.no_persons,
+        face_model=args.face_model,
+        person_model=args.person_model,
+        score_thr=args.face_score,
+    )
+
+    def storyboard_name(video: str) -> str:
+        return os.path.splitext(os.path.basename(video))[0] + "_storyboard"
+
+    failures = 0
+    for n, video in enumerate(videos, start=1):
+        if len(videos) == 1 and args.out:
+            out_dir = args.out
+        elif args.out:
+            out_dir = os.path.join(args.out, storyboard_name(video))
+        else:
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(video)), storyboard_name(video))
+        if len(videos) > 1:
+            log(f"\n[{n}/{len(videos)}]")
+        try:
+            process_video(video, out_dir, detectors, args)
+        except SystemExit as exc:  # не удалось открыть видео — идём дальше
+            log(f"  ошибка: {exc}")
+            failures += 1
+        except Exception as exc:  # noqa: BLE001 — один битый файл не должен останавливать пакет
+            log(f"  ошибка при обработке {video}: {exc}")
+            failures += 1
+    if len(videos) > 1:
+        print(f"\nГотово: {len(videos) - failures} из {len(videos)} видео обработано.")
+    return 1 if failures == len(videos) else 0
 
 
 if __name__ == "__main__":
